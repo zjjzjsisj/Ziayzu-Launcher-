@@ -4,6 +4,18 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// ── CI wiring (GitHub Actions passes these) ──────────────────────────
+// -PbuildVersionCode  → auto-incrementing build number (from CI run number)
+// -PbuildVersionName  → version taken from the release tag (e.g. 1.0.1)
+val ciVersionCode = (project.findProperty("buildVersionCode") as String?)?.toIntOrNull() ?: 1
+val ciVersionName = (project.findProperty("buildVersionName") as String? ?: "1.0.0")
+
+// ── Release signing (injected by CI from GitHub Secrets) ─────────────
+val ksPath = System.getenv("ZIAYZU_KEYSTORE")
+val ksPassword = System.getenv("ZIAYZU_KEYSTORE_PASSWORD")
+val ksAlias = System.getenv("ZIAYZU_KEY_ALIAS")
+val ksKeyPassword = System.getenv("ZIAYZU_KEY_PASSWORD")
+
 android {
     namespace = "com.ziayzu.launcher"
     compileSdk = 34
@@ -12,8 +24,19 @@ android {
         applicationId = "com.ziayzu.launcher"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = ciVersionCode
+        versionName = ciVersionName
+    }
+
+    signingConfigs {
+        if (!ksPath.isNullOrBlank() && !ksPassword.isNullOrBlank() && !ksAlias.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(ksPath)
+                storePassword = ksPassword
+                keyAlias = ksAlias
+                keyPassword = ksKeyPassword ?: ksPassword
+            }
+        }
     }
 
     buildTypes {
@@ -23,6 +46,13 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Real release key when secrets exist; otherwise debug key
+            // so the APK is always signed and installable.
+            signingConfig = if (signingConfigs.findByName("release") != null) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
