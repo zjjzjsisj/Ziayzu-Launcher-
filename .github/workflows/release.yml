@@ -1,0 +1,126 @@
+name: Build & Release APK
+
+on:
+  push:
+    branches: [ main ]        # change to [ master ] if that's your branch
+    tags:     [ 'v*' ]        # pushing a tag like v1.0.1 → creates the release
+  workflow_dispatch:          # manual "Run workflow" button in Actions tab
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.1). Leave empty to only build.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # required to create releases
+
+concurrency:
+  group: ziayzu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: ☕ Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 🧰 Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.8'
+
+      - name: 🔑 Load signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ZIAYZU_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$HOME/ziayzu-release.keystore"
+            echo "ZIAYZU_KEYSTORE=$HOME/ziayzu-release.keystore" >> "$GITHUB_ENV"
+            echo "Release keystore loaded — APK will be release-signed."
+          else
+            echo "No ZIAYZU_KEYSTORE_B64 secret — APK will be debug-signed (installable, but updates won't install over old builds)."
+          fi
+
+      - name: 🏷️ Compute version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_NAME="$GITHUB_REF_NAME"
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            TAG_NAME="v${INPUT_TAG#v}"
+            VERSION="${INPUT_TAG#v}"
+          else
+            TAG_NAME=""
+            VERSION="dev.${{ github.run_number }}"
+          fi
+          echo "RELEASE_TAG=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
+          echo "Building Ziayzu Launcher $VERSION (build #${{ github.run_number }})"
+
+      - name: 🏗️ Build release APK
+        env:
+          ZIAYZU_KEYSTORE:          ${{ env.ZIAYZU_KEYSTORE }}
+          ZIAYZU_KEYSTORE_PASSWORD: ${{ secrets.ZIAYZU_KEYSTORE_PASSWORD }}
+          ZIAYZU_KEY_ALIAS:         ${{ secrets.ZIAYZU_KEY_ALIAS }}
+          ZIAYZU_KEY_PASSWORD:      ${{ secrets.ZIAYZU_KEY_PASSWORD }}
+        run: |
+          if [ -f ./gradlew ]; then GRADLE="./gradlew"; else GRADLE="gradle"; fi
+          $GRADLE assembleRelease \
+            -PbuildVersionCode="${{ github.run_number }}" \
+            -PbuildVersionName="$VERSION_NAME" \
+            --no-daemon --stacktrace
+
+      - name: 📦 Stage APK
+        run: |
+          OUT="app/build/outputs/apk/release"
+          if   [ -f "$OUT/app-release.apk" ];          then SRC="$OUT/app-release.apk"
+          elif [ -f "$OUT/app-release-unsigned.apk" ]; then SRC="$OUT/app-release-unsigned.apk"
+          else
+            echo "No APK was produced — check the build log above."
+            exit 1
+          fi
+          cp "$SRC" "ZiayzuLauncher-$VERSION_NAME.apk"
+          ls -lh ZiayzuLauncher-*.apk
+
+      - name: 📤 Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZiayzuLauncher-${{ env.VERSION_NAME }}
+          path: ZiayzuLauncher-${{ env.VERSION_NAME }}.apk
+          retention-days: 30
+
+      - name: 🚀 Publish GitHub Release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          APK="ZiayzuLauncher-$VERSION_NAME.apk"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists — attaching APK to it."
+            gh release upload "$RELEASE_TAG" "$APK" --clobber
+          else
+            ARGS=(--target "$GITHUB_SHA" --title "Ziayzu Launcher $RELEASE_TAG" --generate-notes)
+            if [[ "$PRERELEASE" == "true" ]]; then
+              ARGS+=(--prerelease)
+            else
+              ARGS+=(--latest)
+            fi
+            gh release create "$RELEASE_TAG" "$APK" "${ARGS[@]}"
+            echo "✓ Release $RELEASE_TAG published with $APK"
+          fi
